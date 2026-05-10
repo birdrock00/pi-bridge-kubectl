@@ -1,0 +1,14 @@
+{
+  "name": "pi-bridge-kubectl",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Matrix chat bridge that runs Pi with kubectl available.",
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node matrix-bot.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
