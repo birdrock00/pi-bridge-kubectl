@@ -20,6 +20,7 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+      ansible \
       bash \
       ca-certificates \
       curl \
@@ -34,6 +35,8 @@ COPY matrix-bot.js /app/matrix-bot.js
 
 RUN set -eux; \
     chmod +x /usr/local/bin/kubectl; \
+    ansible-playbook --version; \
+    ansible-vault --version; \
     curl -fsSL "https://github.com/earendil-works/pi/releases/download/${PI_VERSION}/pi-linux-x64.tar.gz" -o /tmp/pi-linux-x64.tar.gz; \
     echo "${PI_LINUX_X64_SHA256}  /tmp/pi-linux-x64.tar.gz" | sha256sum -c -; \
     mkdir -p /opt/pi; \
