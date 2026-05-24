@@ -59,6 +59,10 @@ function log(message) {
   console.log(`[MATRIX] ${message}`)
 }
 
+function logError(message) {
+  console.error(`[MATRIX] ${message}`)
+}
+
 function requireEnv(name, value) {
   if (!value) {
     throw new Error(`${name} is required for Matrix connector`)
@@ -77,7 +81,7 @@ function startHealthServer() {
   })
 
   server.listen(PORT, "0.0.0.0", () => {
-    log(`health endpoint listening on ${PORT}`)
+    log("health endpoint listening")
   })
 }
 
@@ -114,7 +118,7 @@ async function getAccessToken() {
       initial_device_display_name: MATRIX_BOT_NAME,
     }),
   })
-  log(`logged in as ${data.user_id}`)
+  log("authenticated with Matrix")
   return data.access_token
 }
 
@@ -163,8 +167,8 @@ async function setTyping(token, roomId, typing) {
       token,
       body: JSON.stringify({ typing, timeout: 30000 }),
     })
-  } catch (error) {
-    console.error(error)
+  } catch {
+    logError("failed to update typing state")
   }
 }
 
@@ -288,7 +292,7 @@ async function completeRequest(token, roomId, prompt, sessionName, statusEventId
           progressEventId = await sendMessage(token, roomId, body)
         }
       })
-      .catch((error) => console.error(error))
+      .catch(() => logError("failed to publish live progress"))
   }
 
   const onProgress = (text) => {
@@ -310,7 +314,7 @@ async function completeRequest(token, roomId, prompt, sessionName, statusEventId
         statusEventId,
         `Running Pi; ${formatElapsed(Date.now() - startedAt)} elapsed. I will post the result when it finishes.`,
       ))
-      .catch((error) => console.error(error))
+      .catch(() => logError("failed to update progress status"))
   }, MATRIX_PROGRESS_INTERVAL_MS)
 
   await setTyping(token, roomId, true)
@@ -320,14 +324,14 @@ async function completeRequest(token, roomId, prompt, sessionName, statusEventId
     publishLiveOutput()
     await messageUpdate
     await replaceMessage(token, roomId, statusEventId, `Completed Pi after ${formatElapsed(Date.now() - startedAt)}. Posting result.`)
-      .catch((error) => console.error(error))
+      .catch(() => logError("failed to update completion status"))
     await sendMessage(token, roomId, answer)
-  } catch (error) {
-    console.error(error)
+  } catch {
+    logError("Pi request failed")
     await messageUpdate
     await replaceMessage(token, roomId, statusEventId, `Failed Pi after ${formatElapsed(Date.now() - startedAt)}.`)
-      .catch((editError) => console.error(editError))
-    await sendMessage(token, roomId, `Pi request failed: ${error.message}`)
+      .catch(() => logError("failed to update failure status"))
+    await sendMessage(token, roomId, "Pi request failed.")
   } finally {
     if (liveTimer) clearTimeout(liveTimer)
     clearInterval(elapsedUpdate)
@@ -351,11 +355,11 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
     return
   }
 
-  log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
+  log("handling Matrix request")
   handledCount += 1
   const statusEventId = await sendMessage(token, roomId, "Accepted. Running Pi; I will post the result when it finishes.")
   void completeRequest(token, roomId, prompt, requestSessionName(roomId, event), statusEventId)
-    .catch((error) => console.error(error))
+    .catch(() => logError("background Matrix request failed"))
 }
 
 async function main() {
@@ -367,7 +371,7 @@ async function main() {
   let since = ""
   let firstSync = true
 
-  log(`listening for ${MATRIX_TRIGGER} as ${ownUserId}`)
+  log("listening for Matrix requests")
   while (true) {
     try {
       const query = new URLSearchParams({ timeout: String(MATRIX_SYNC_TIMEOUT_MS) })
@@ -378,7 +382,7 @@ async function main() {
 
       for (const roomId of Object.keys(sync.rooms?.invite || {})) {
         if (MATRIX_ALLOWED_ROOMS.size > 0 && !MATRIX_ALLOWED_ROOMS.has(roomId)) continue
-        log(`joining invited room ${roomId}`)
+        log("joining invited Matrix room")
         await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
           method: "POST",
           token,
@@ -395,14 +399,14 @@ async function main() {
           await handleTimelineEvent(token, roomId, event, ownUserId)
         }
       }
-    } catch (error) {
-      console.error(error)
+    } catch {
+      logError("Matrix sync failed; retrying")
       await new Promise((resolve) => setTimeout(resolve, 5000))
     }
   }
 }
 
-main().catch((error) => {
-  console.error(error)
+main().catch(() => {
+  logError("Matrix connector terminated")
   process.exit(1)
 })
