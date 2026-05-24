@@ -9,6 +9,7 @@ const MATRIX_PASSWORD = process.env.MATRIX_PASSWORD || ""
 const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN || ""
 const MATRIX_DEVICE_ID = process.env.MATRIX_DEVICE_ID || "PI_BRIDGE_001"
 const MATRIX_SYNC_TIMEOUT_MS = parseInt(process.env.MATRIX_SYNC_TIMEOUT_MS || "30000", 10)
+const MATRIX_PROGRESS_INTERVAL_MS = parseInt(process.env.MATRIX_PROGRESS_INTERVAL_MS || "60000", 10)
 const MATRIX_TRIGGER = process.env.MATRIX_TRIGGER || "!pi"
 const MATRIX_BOT_NAME = process.env.MATRIX_BOT_NAME || "pi"
 const MATRIX_ALLOWED_ROOMS = new Set(
@@ -24,6 +25,7 @@ const WORKSPACE_DIR = process.env.WORKSPACE_DIR || process.cwd()
 const PI_SESSION_BASE_DIR = process.env.PI_SESSION_BASE_DIR || "/data/pi/sessions"
 const PI_REQUEST_TIMEOUT_MS = parseInt(process.env.PI_REQUEST_TIMEOUT_MS || "900000", 10)
 const PI_MAX_OUTPUT_BYTES = parseInt(process.env.PI_MAX_OUTPUT_BYTES || "180000", 10)
+const PI_PROGRESS_PUBLISH_INTERVAL_MS = parseInt(process.env.PI_PROGRESS_PUBLISH_INTERVAL_MS || "3000", 10)
 const PI_MODEL = process.env.PI_MODEL || process.env.CHAT_MODEL || process.env.DEFAULT_MODEL || ""
 const PI_PROVIDER = process.env.PI_PROVIDER || ""
 const PI_THINKING = process.env.PI_THINKING || ""
@@ -33,8 +35,8 @@ const PI_EXTRA_ARGS = splitArgs(process.env.PI_EXTRA_ARGS || "")
 let startedAt = new Date().toISOString()
 let lastSyncAt = null
 let handledCount = 0
+let activeRequests = 0
 const seenEventIds = new Set()
-const roomQueues = new Map()
 
 function isTruthy(value) {
   return /^(1|true|yes|on)$/i.test(String(value || ""))
@@ -67,7 +69,7 @@ function startHealthServer() {
   const server = http.createServer((request, response) => {
     if (request.url === "/health") {
       response.writeHead(200, { "Content-Type": "application/json" })
-      response.end(JSON.stringify({ ok: true, startedAt, lastSyncAt, handledCount }))
+      response.end(JSON.stringify({ ok: true, startedAt, lastSyncAt, handledCount, activeRequests }))
       return
     }
     response.writeHead(404, { "Content-Type": "text/plain" })
@@ -118,9 +120,10 @@ async function getAccessToken() {
 
 async function sendMessage(token, roomId, body) {
   const chunks = body.match(/[\s\S]{1,3500}/g) || [body]
+  let firstEventId = ""
   for (const chunk of chunks) {
     const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
-    await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
+    const event = await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
       method: "PUT",
       token,
       body: JSON.stringify({
@@ -128,7 +131,28 @@ async function sendMessage(token, roomId, body) {
         body: chunk,
       }),
     })
+    firstEventId ||= event.event_id || ""
   }
+  return firstEventId
+}
+
+async function replaceMessage(token, roomId, eventId, body) {
+  if (!eventId) {
+    await sendMessage(token, roomId, body)
+    return
+  }
+
+  const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
+    method: "PUT",
+    token,
+    body: JSON.stringify({
+      msgtype: "m.text",
+      body: `* ${body}`,
+      "m.new_content": { msgtype: "m.text", body },
+      "m.relates_to": { rel_type: "m.replace", event_id: eventId },
+    }),
+  })
 }
 
 async function setTyping(token, roomId, typing) {
@@ -148,8 +172,25 @@ function safeRoomName(roomId) {
   return roomId.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120) || "default"
 }
 
-function buildPiArgs(roomId, prompt) {
-  const args = ["--print", "--continue", "--session-dir", path.join(PI_SESSION_BASE_DIR, safeRoomName(roomId))]
+function requestSessionName(roomId, event) {
+  const room = safeRoomName(roomId).slice(0, 40)
+  const eventId = safeRoomName(String(event.event_id || event.origin_server_ts || Date.now())).slice(0, 70)
+  return `${room}-${eventId}`
+}
+
+function formatElapsed(elapsedMs) {
+  const seconds = Math.floor(elapsedMs / 1000)
+  const minutes = Math.floor(seconds / 60)
+  return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`
+}
+
+function formatProgress(text) {
+  if (text.length <= 3100) return text
+  return `${text.slice(0, 1450)}\n\n... live output truncated ...\n\n${text.slice(-1450)}`
+}
+
+function buildPiArgs(sessionName, prompt) {
+  const args = ["--print", "--continue", "--session-dir", path.join(PI_SESSION_BASE_DIR, sessionName)]
 
   if (PI_PROVIDER) args.push("--provider", PI_PROVIDER)
   if (PI_MODEL) args.push("--model", PI_MODEL)
@@ -177,13 +218,13 @@ function appendLimited(current, chunk, maxBytes) {
   return buffer.subarray(buffer.length - maxBytes).toString("utf8")
 }
 
-function runPi(roomId, prompt) {
+function runPi(sessionName, prompt, onProgress) {
   const cwd = fs.existsSync(WORKSPACE_DIR) ? WORKSPACE_DIR : process.cwd()
-  const sessionDir = path.join(PI_SESSION_BASE_DIR, safeRoomName(roomId))
+  const sessionDir = path.join(PI_SESSION_BASE_DIR, sessionName)
   fs.mkdirSync(sessionDir, { recursive: true })
 
   return new Promise((resolve, reject) => {
-    const args = buildPiArgs(roomId, prompt)
+    const args = buildPiArgs(sessionName, prompt)
     const child = spawn("pi", args, {
       cwd,
       env: { ...process.env, PI_CODING_AGENT_SESSION_DIR: sessionDir },
@@ -199,6 +240,7 @@ function runPi(roomId, prompt) {
 
     child.stdout.on("data", (chunk) => {
       stdout = appendLimited(stdout, chunk.toString(), PI_MAX_OUTPUT_BYTES)
+      onProgress(stdout.trim())
     })
     child.stderr.on("data", (chunk) => {
       stderr = appendLimited(stderr, chunk.toString(), PI_MAX_OUTPUT_BYTES)
@@ -224,15 +266,74 @@ function messageBody(event) {
   return event.content.body || ""
 }
 
-function enqueueRoomTask(roomId, task) {
-  const previous = roomQueues.get(roomId) || Promise.resolve()
-  const next = previous.then(task, task).finally(() => {
-    if (roomQueues.get(roomId) === next) {
-      roomQueues.delete(roomId)
+async function completeRequest(token, roomId, prompt, sessionName, statusEventId) {
+  const startedAt = Date.now()
+  let progressEventId = ""
+  let latestOutput = ""
+  let liveTimer = null
+  let lastPublishedAt = 0
+  let messageUpdate = Promise.resolve()
+  activeRequests += 1
+
+  const publishLiveOutput = () => {
+    liveTimer = null
+    if (!latestOutput) return
+    lastPublishedAt = Date.now()
+    const body = `Live output (${formatElapsed(Date.now() - startedAt)} elapsed):\n${formatProgress(latestOutput)}`
+    messageUpdate = messageUpdate
+      .then(async () => {
+        if (progressEventId) {
+          await replaceMessage(token, roomId, progressEventId, body)
+        } else {
+          progressEventId = await sendMessage(token, roomId, body)
+        }
+      })
+      .catch((error) => console.error(error))
+  }
+
+  const onProgress = (text) => {
+    latestOutput = text
+    const remainingMs = PI_PROGRESS_PUBLISH_INTERVAL_MS - (Date.now() - lastPublishedAt)
+    if (remainingMs <= 0) {
+      if (liveTimer) clearTimeout(liveTimer)
+      publishLiveOutput()
+    } else if (!liveTimer) {
+      liveTimer = setTimeout(publishLiveOutput, remainingMs)
     }
-  })
-  roomQueues.set(roomId, next)
-  return next
+  }
+
+  const elapsedUpdate = setInterval(() => {
+    messageUpdate = messageUpdate
+      .then(() => replaceMessage(
+        token,
+        roomId,
+        statusEventId,
+        `Running Pi; ${formatElapsed(Date.now() - startedAt)} elapsed. I will post the result when it finishes.`,
+      ))
+      .catch((error) => console.error(error))
+  }, MATRIX_PROGRESS_INTERVAL_MS)
+
+  await setTyping(token, roomId, true)
+  try {
+    const answer = await runPi(sessionName, prompt, onProgress)
+    if (liveTimer) clearTimeout(liveTimer)
+    publishLiveOutput()
+    await messageUpdate
+    await replaceMessage(token, roomId, statusEventId, `Completed Pi after ${formatElapsed(Date.now() - startedAt)}. Posting result.`)
+      .catch((error) => console.error(error))
+    await sendMessage(token, roomId, answer)
+  } catch (error) {
+    console.error(error)
+    await messageUpdate
+    await replaceMessage(token, roomId, statusEventId, `Failed Pi after ${formatElapsed(Date.now() - startedAt)}.`)
+      .catch((editError) => console.error(editError))
+    await sendMessage(token, roomId, `Pi request failed: ${error.message}`)
+  } finally {
+    if (liveTimer) clearTimeout(liveTimer)
+    clearInterval(elapsedUpdate)
+    activeRequests -= 1
+    await setTyping(token, roomId, false)
+  }
 }
 
 async function handleTimelineEvent(token, roomId, event, ownUserId) {
@@ -250,20 +351,11 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
     return
   }
 
-  enqueueRoomTask(roomId, async () => {
-    log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
-    handledCount += 1
-    await setTyping(token, roomId, true)
-    try {
-      const answer = await runPi(roomId, prompt)
-      await sendMessage(token, roomId, answer)
-    } catch (error) {
-      console.error(error)
-      await sendMessage(token, roomId, `Pi request failed: ${error.message}`)
-    } finally {
-      await setTyping(token, roomId, false)
-    }
-  })
+  log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
+  handledCount += 1
+  const statusEventId = await sendMessage(token, roomId, "Accepted. Running Pi; I will post the result when it finishes.")
+  void completeRequest(token, roomId, prompt, requestSessionName(roomId, event), statusEventId)
+    .catch((error) => console.error(error))
 }
 
 async function main() {
