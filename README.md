@@ -1,6 +1,6 @@
 # pi-bridge-kubectl
 
-Matrix chat bridge that responds to `!pi` by running the Pi coding agent in a container that also has `kubectl`.
+Matrix chat bridge that runs the Pi coding agent in a Matrix thread with `kubectl` available. Start a conversation with a top-level `!pi` message; any participant can reply in that thread without repeating `!pi`.
 
 The image installs:
 
@@ -20,14 +20,13 @@ Required:
 
 Common optional values:
 
-- `MATRIX_TRIGGER`, default `!pi`
+- `MATRIX_TRIGGER`, default `!pi`; starts a new conversation thread
 - `MATRIX_ROOM_ID` or `MATRIX_ALLOWED_ROOMS`, comma-separated room allowlist
 - `GIT_REPO_URL`, cloned into `WORKSPACE_DIR` at startup
 - `WORKSPACE_DIR`, default `/workspace/rpi`
 - `PI_MODEL`, `PI_PROVIDER`, `PI_THINKING`
 - `PI_EXTRA_ARGS`, either JSON string array or whitespace-separated arguments
-- `PI_REQUEST_TIMEOUT_MS`, default `900000`
 
 Provider credentials such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` can be supplied in the same env file.
 
-The bot stores per-room Pi sessions under `PI_SESSION_BASE_DIR`, default `/data/pi/sessions`.
+The bot stores per-thread Pi sessions under `PI_SESSION_BASE_DIR`, default `/data/pi/sessions`, and does not impose a deadline on an active request.

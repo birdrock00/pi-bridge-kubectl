@@ -10,7 +10,6 @@ ARG PI_LINUX_X64_SHA256=d67657a30d49c9faca80868d2a4bdba4dfcac04702893f45a6d14b24
 ENV PORT=5000 \
     PI_ENV_FILE=/secrets/pi/.env \
     PI_SESSION_BASE_DIR=/data/pi/sessions \
-    PI_REQUEST_TIMEOUT_MS=900000 \
     WORKSPACE_DIR=/workspace/rpi \
     HOME=/root \
     PI_CODING_AGENT_DIR=/data/pi/agent \
