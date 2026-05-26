@@ -23,7 +23,6 @@ const MATRIX_IGNORE_INITIAL_SYNC = isTruthy(process.env.MATRIX_IGNORE_INITIAL_SY
 const PORT = parseInt(process.env.PORT || "5000", 10)
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || process.cwd()
 const PI_SESSION_BASE_DIR = process.env.PI_SESSION_BASE_DIR || "/data/pi/sessions"
-const PI_REQUEST_TIMEOUT_MS = parseInt(process.env.PI_REQUEST_TIMEOUT_MS || "900000", 10)
 const PI_MAX_OUTPUT_BYTES = parseInt(process.env.PI_MAX_OUTPUT_BYTES || "180000", 10)
 const PI_PROGRESS_PUBLISH_INTERVAL_MS = parseInt(process.env.PI_PROGRESS_PUBLISH_INTERVAL_MS || "3000", 10)
 const PI_MODEL = process.env.PI_MODEL || process.env.CHAT_MODEL || process.env.DEFAULT_MODEL || ""
@@ -37,6 +36,8 @@ let lastSyncAt = null
 let handledCount = 0
 let activeRequests = 0
 const seenEventIds = new Set()
+const activeThreads = new Set()
+const threadQueues = new Map()
 
 function isTruthy(value) {
   return /^(1|true|yes|on)$/i.test(String(value || ""))
@@ -122,27 +123,36 @@ async function getAccessToken() {
   return data.access_token
 }
 
-async function sendMessage(token, roomId, body) {
+async function sendMessage(token, roomId, body, threadRootId = "", replyToEventId = "") {
   const chunks = body.match(/[\s\S]{1,3500}/g) || [body]
   let firstEventId = ""
   for (const chunk of chunks) {
     const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const content = {
+      msgtype: "m.text",
+      body: chunk,
+    }
+    if (threadRootId) {
+      content["m.relates_to"] = {
+        rel_type: "m.thread",
+        event_id: threadRootId,
+        is_falling_back: true,
+        "m.in_reply_to": { event_id: replyToEventId || threadRootId },
+      }
+    }
     const event = await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
       method: "PUT",
       token,
-      body: JSON.stringify({
-        msgtype: "m.text",
-        body: chunk,
-      }),
+      body: JSON.stringify(content),
     })
     firstEventId ||= event.event_id || ""
   }
   return firstEventId
 }
 
-async function replaceMessage(token, roomId, eventId, body) {
+async function replaceMessage(token, roomId, eventId, body, threadRootId = "", replyToEventId = "") {
   if (!eventId) {
-    await sendMessage(token, roomId, body)
+    await sendMessage(token, roomId, body, threadRootId, replyToEventId)
     return
   }
 
@@ -176,9 +186,9 @@ function safeRoomName(roomId) {
   return roomId.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120) || "default"
 }
 
-function requestSessionName(roomId, event) {
+function threadSessionName(roomId, rootId) {
   const room = safeRoomName(roomId).slice(0, 40)
-  const eventId = safeRoomName(String(event.event_id || event.origin_server_ts || Date.now())).slice(0, 70)
+  const eventId = safeRoomName(String(rootId)).slice(0, 70)
   return `${room}-${eventId}`
 }
 
@@ -193,8 +203,15 @@ function formatProgress(text) {
   return `${text.slice(0, 1450)}\n\n... live output truncated ...\n\n${text.slice(-1450)}`
 }
 
-function buildPiArgs(sessionName, prompt) {
-  const args = ["--print", "--continue", "--session-dir", path.join(PI_SESSION_BASE_DIR, sessionName)]
+function hasPiSession(sessionName) {
+  const sessionDir = path.join(PI_SESSION_BASE_DIR, sessionName)
+  return fs.existsSync(sessionDir) && fs.readdirSync(sessionDir).length > 0
+}
+
+function buildPiArgs(sessionName, prompt, continueSession) {
+  const args = ["--print"]
+  if (continueSession) args.push("--continue")
+  args.push("--session-dir", path.join(PI_SESSION_BASE_DIR, sessionName))
 
   if (PI_PROVIDER) args.push("--provider", PI_PROVIDER)
   if (PI_MODEL) args.push("--model", PI_MODEL)
@@ -222,13 +239,13 @@ function appendLimited(current, chunk, maxBytes) {
   return buffer.subarray(buffer.length - maxBytes).toString("utf8")
 }
 
-function runPi(sessionName, prompt, onProgress) {
+function runPi(sessionName, prompt, continueSession, onProgress) {
   const cwd = fs.existsSync(WORKSPACE_DIR) ? WORKSPACE_DIR : process.cwd()
   const sessionDir = path.join(PI_SESSION_BASE_DIR, sessionName)
   fs.mkdirSync(sessionDir, { recursive: true })
 
   return new Promise((resolve, reject) => {
-    const args = buildPiArgs(sessionName, prompt)
+    const args = buildPiArgs(sessionName, prompt, continueSession)
     const child = spawn("pi", args, {
       cwd,
       env: { ...process.env, PI_CODING_AGENT_SESSION_DIR: sessionDir },
@@ -237,11 +254,6 @@ function runPi(sessionName, prompt, onProgress) {
 
     let stdout = ""
     let stderr = ""
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM")
-      reject(new Error(`Pi request timed out after ${PI_REQUEST_TIMEOUT_MS}ms`))
-    }, PI_REQUEST_TIMEOUT_MS)
-
     child.stdout.on("data", (chunk) => {
       stdout = appendLimited(stdout, chunk.toString(), PI_MAX_OUTPUT_BYTES)
       onProgress(stdout.trim())
@@ -250,11 +262,9 @@ function runPi(sessionName, prompt, onProgress) {
       stderr = appendLimited(stderr, chunk.toString(), PI_MAX_OUTPUT_BYTES)
     })
     child.on("error", (error) => {
-      clearTimeout(timer)
       reject(error)
     })
     child.on("close", (code, signal) => {
-      clearTimeout(timer)
       if (code === 0) {
         resolve(stdout.trim() || "(no response)")
         return
@@ -270,7 +280,44 @@ function messageBody(event) {
   return event.content.body || ""
 }
 
-async function completeRequest(token, roomId, prompt, sessionName, statusEventId) {
+function threadRootId(event) {
+  const relation = event?.content?.["m.relates_to"]
+  return relation?.rel_type === "m.thread" ? relation.event_id || "" : ""
+}
+
+function isTriggerMessage(body) {
+  return body === MATRIX_TRIGGER || body.startsWith(`${MATRIX_TRIGGER} `)
+}
+
+function threadKey(roomId, rootId) {
+  return `${roomId}:${rootId}`
+}
+
+async function isActiveThread(token, roomId, rootId) {
+  const key = threadKey(roomId, rootId)
+  if (activeThreads.has(key)) return true
+  try {
+    const root = await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(rootId)}`, { token })
+    if (isTriggerMessage(messageBody(root).trim())) {
+      activeThreads.add(key)
+      return true
+    }
+  } catch {
+    logError("failed to load Matrix thread root")
+  }
+  return false
+}
+
+function enqueueThreadTask(key, task) {
+  const previous = threadQueues.get(key) || Promise.resolve()
+  const next = previous.then(task, task).finally(() => {
+    if (threadQueues.get(key) === next) threadQueues.delete(key)
+  })
+  threadQueues.set(key, next)
+  return next
+}
+
+async function completeRequest(token, roomId, prompt, sessionName, continueSession, statusEventId, rootId, replyToEventId) {
   const startedAt = Date.now()
   let progressEventId = ""
   let latestOutput = ""
@@ -287,9 +334,9 @@ async function completeRequest(token, roomId, prompt, sessionName, statusEventId
     messageUpdate = messageUpdate
       .then(async () => {
         if (progressEventId) {
-          await replaceMessage(token, roomId, progressEventId, body)
+          await replaceMessage(token, roomId, progressEventId, body, rootId, replyToEventId)
         } else {
-          progressEventId = await sendMessage(token, roomId, body)
+          progressEventId = await sendMessage(token, roomId, body, rootId, replyToEventId)
         }
       })
       .catch(() => logError("failed to publish live progress"))
@@ -313,25 +360,27 @@ async function completeRequest(token, roomId, prompt, sessionName, statusEventId
         roomId,
         statusEventId,
         `Running Pi; ${formatElapsed(Date.now() - startedAt)} elapsed. I will post the result when it finishes.`,
+        rootId,
+        replyToEventId,
       ))
       .catch(() => logError("failed to update progress status"))
   }, MATRIX_PROGRESS_INTERVAL_MS)
 
   await setTyping(token, roomId, true)
   try {
-    const answer = await runPi(sessionName, prompt, onProgress)
+    const answer = await runPi(sessionName, prompt, continueSession, onProgress)
     if (liveTimer) clearTimeout(liveTimer)
     publishLiveOutput()
     await messageUpdate
-    await replaceMessage(token, roomId, statusEventId, `Completed Pi after ${formatElapsed(Date.now() - startedAt)}. Posting result.`)
+    await replaceMessage(token, roomId, statusEventId, `Completed Pi after ${formatElapsed(Date.now() - startedAt)}. Posting result.`, rootId, replyToEventId)
       .catch(() => logError("failed to update completion status"))
-    await sendMessage(token, roomId, answer)
+    await sendMessage(token, roomId, answer, rootId, replyToEventId)
   } catch {
     logError("Pi request failed")
     await messageUpdate
-    await replaceMessage(token, roomId, statusEventId, `Failed Pi after ${formatElapsed(Date.now() - startedAt)}.`)
+    await replaceMessage(token, roomId, statusEventId, `Failed Pi after ${formatElapsed(Date.now() - startedAt)}.`, rootId, replyToEventId)
       .catch(() => logError("failed to update failure status"))
-    await sendMessage(token, roomId, "Pi request failed.")
+    await sendMessage(token, roomId, "Pi request failed.", rootId, replyToEventId)
   } finally {
     if (liveTimer) clearTimeout(liveTimer)
     clearInterval(elapsedUpdate)
@@ -347,18 +396,32 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
   if (event.event_id) seenEventIds.add(event.event_id)
 
   const body = messageBody(event).trim()
-  if (!body.startsWith(MATRIX_TRIGGER)) return
+  if (!body) return
 
-  const prompt = body.slice(MATRIX_TRIGGER.length).trim()
+  let rootId = threadRootId(event)
+  const startsThread = !rootId && isTriggerMessage(body)
+  if (!startsThread && (!rootId || !(await isActiveThread(token, roomId, rootId)))) return
+  if (startsThread) {
+    rootId = event.event_id
+    if (!rootId) return
+    activeThreads.add(threadKey(roomId, rootId))
+  }
+
+  const prompt = startsThread ? body.slice(MATRIX_TRIGGER.length).trim() : body
   if (!prompt) {
-    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} <request>`)
+    await sendMessage(token, roomId, "Started a new Pi conversation. Reply in this thread with the first request.", rootId, event.event_id)
     return
   }
 
   log("handling Matrix request")
   handledCount += 1
-  const statusEventId = await sendMessage(token, roomId, "Accepted. Running Pi; I will post the result when it finishes.")
-  void completeRequest(token, roomId, prompt, requestSessionName(roomId, event), statusEventId)
+  const key = threadKey(roomId, rootId)
+  const sessionName = threadSessionName(roomId, rootId)
+  void enqueueThreadTask(key, async () => {
+    const continueSession = !startsThread && hasPiSession(sessionName)
+    const statusEventId = await sendMessage(token, roomId, "Accepted. Running Pi; I will post the result when it finishes.", rootId, event.event_id)
+    await completeRequest(token, roomId, prompt, sessionName, continueSession, statusEventId, rootId, event.event_id)
+  })
     .catch(() => logError("background Matrix request failed"))
 }
 
