@@ -319,7 +319,6 @@ function enqueueThreadTask(key, task) {
 
 async function completeRequest(token, roomId, prompt, sessionName, continueSession, statusEventId, rootId, replyToEventId) {
   const startedAt = Date.now()
-  let progressEventId = ""
   let latestOutput = ""
   let liveTimer = null
   let lastPublishedAt = 0
@@ -332,13 +331,7 @@ async function completeRequest(token, roomId, prompt, sessionName, continueSessi
     lastPublishedAt = Date.now()
     const body = `Live output (${formatElapsed(Date.now() - startedAt)} elapsed):\n${formatProgress(latestOutput)}`
     messageUpdate = messageUpdate
-      .then(async () => {
-        if (progressEventId) {
-          await replaceMessage(token, roomId, progressEventId, body, rootId, replyToEventId)
-        } else {
-          progressEventId = await sendMessage(token, roomId, body, rootId, replyToEventId)
-        }
-      })
+      .then(() => sendMessage(token, roomId, body, rootId, replyToEventId))
       .catch(() => logError("failed to publish live progress"))
   }
 
