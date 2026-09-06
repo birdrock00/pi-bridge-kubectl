@@ -4,8 +4,8 @@ FROM docker.io/bitnami/kubectl:latest AS kubectl
 
 FROM node:22-bookworm-slim AS runtime
 
-ARG PI_VERSION=v0.74.0
-ARG PI_LINUX_X64_SHA256=d67657a30d49c9faca80868d2a4bdba4dfcac04702893f45a6d14b249345eb8d
+ARG PI_VERSION=v0.85.1
+ARG PI_LINUX_X64_SHA256=494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a
 
 ENV PORT=5000 \
     PI_ENV_FILE=/secrets/pi/.env \

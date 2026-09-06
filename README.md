@@ -3,6 +3,32 @@
 Matrix chat bridge that responds to `!pi` by running the Pi coding agent in a
 container that also includes `kubectl`, `git`, and `ansible`.
 
+## Live Output
+
+The bridge runs Pi in `--print --mode json`, so it receives the full streaming
+session event stream (text deltas, tool calls, streamed tool output). It
+renders those events into a TUI-style transcript and publishes it as a
+**single Matrix message that is edited in place** at a steady cadence, the way
+a terminal redraws its screen:
+
+```text
+⏳ Running Pi — 1m 05s elapsed — running bash…
+
+⏺ bash
+  $ kubectl get pods -n kube-system
+  NAME     READY   STATUS    ...
+
+⏳ bash (running…)
+  $ kubectl logs deploy/matrix -n matrix --tail=50
+```
+
+When the run finishes, the same message is replaced with the final result
+(`✅ Completed Pi after 1m 05s` plus the answer), or with a failure summary
+including the last known output. No separate progress messages are posted,
+so the room stays clean. Tool output is clipped per call and older transcript
+blocks are trimmed from the top so the live message stays well under the
+Matrix event size limit.
+
 The image installs:
 
 - Pi `v0.74.0` from `earendil-works/pi` using a pinned release archive and
@@ -53,8 +79,8 @@ intended to accept requests from every Matrix room it joins.
 | `MATRIX_ROOM_ID` | No | Empty | Comma-separated room allowlist; takes precedence over `MATRIX_ALLOWED_ROOMS`. Empty allows all joined rooms. |
 | `MATRIX_ALLOWED_ROOMS` | No | Empty | Comma-separated room allowlist used when `MATRIX_ROOM_ID` is empty. |
 | `MATRIX_SYNC_TIMEOUT_MS` | No | `30000` | Matrix long-poll sync timeout in milliseconds. |
-| `MATRIX_PROGRESS_INTERVAL_MS` | No | `60000` | Frequency of elapsed-time status updates in milliseconds. |
 | `MATRIX_IGNORE_INITIAL_SYNC` | No | `false` | Set to `true`, `yes`, `on`, or `1` to avoid handling timeline items returned by the first sync after startup. |
+| `MATRIX_MESSAGE_CHUNK_CHARS` | No | `30000` | Chunk size used when a new Matrix message must be split. |
 | `PORT` | No | `5000` | Port for the `/health` HTTP endpoint. |
 
 ### Pi Agent And Output
@@ -69,8 +95,10 @@ intended to accept requests from every Matrix room it joins.
 | `PI_TOOLS` | No | Empty | Tools selection passed to Pi. |
 | `PI_EXTRA_ARGS` | No | Empty | Additional Pi CLI arguments, as a JSON string array or whitespace-separated values. |
 | `PI_REQUEST_TIMEOUT_MS` | No | `900000` | Maximum duration of one Matrix-requested Pi run in milliseconds. |
-| `PI_MAX_OUTPUT_BYTES` | No | `180000` | Maximum buffered stdout/stderr data retained during a request. |
-| `PI_PROGRESS_PUBLISH_INTERVAL_MS` | No | `3000` | Minimum interval between live output posts to Matrix in milliseconds. |
+| `PI_MAX_OUTPUT_BYTES` | No | `180000` | Maximum buffered raw (non-JSON) stdout/stderr data retained during a request. |
+| `PI_PROGRESS_PUBLISH_INTERVAL_MS` | No | `3000` | Interval between in-place updates of the live Matrix message in milliseconds. |
+| `PI_LIVE_MESSAGE_MAX_CHARS` | No | `24000` | Maximum body size of the live/final Matrix message. Larger final results are posted as separate messages. |
+| `PI_TOOL_OUTPUT_MAX_CHARS` | No | `1200` | Maximum characters of tool output shown per tool call in the live message. |
 | `PI_SESSION_BASE_DIR` | No | `/data/pi/sessions` | Location for per-request Pi session directories. Mount persistent storage here if sessions must survive pod replacement. |
 | `PI_CODING_AGENT_DIR` | No | `/data/pi/agent` | Container-created Pi agent data directory. |
 
@@ -272,5 +300,5 @@ These arguments apply only when building the image:
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `PI_VERSION` | `v0.74.0` | Pi release version downloaded from GitHub. |
+| `PI_VERSION` | `v0.85.1` | Pi release version downloaded from GitHub. |
 | `PI_LINUX_X64_SHA256` | Pinned archive digest in the Dockerfile | Required checksum for the selected Pi Linux x64 archive. Update it together with `PI_VERSION`. |
